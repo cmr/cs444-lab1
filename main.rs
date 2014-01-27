@@ -30,6 +30,7 @@ struct Shell {
     history: ~[Command]
 }
 
+#[deriving(Clone)]
 struct Command {
     /// Program to run (first non-env-var-setting part of line)
     program: ~str,
@@ -44,7 +45,7 @@ impl std::fmt::Default for Command {
     fn fmt(v: &Command, f: &mut std::fmt::Formatter) {
         write!(f.buf, " {}", v.program);
         for arg in v.arguments.iter() {
-            write!(f.buf, " {}", arg.as_str());
+            write!(f.buf, " {}", arg.as_str().unwrap());
         }
         v.out.as_ref().map(|o| write!(f.buf, " > {}", *o));
         v.in_.as_ref().map(|i| write!(f.buf, " < {}", *i));
@@ -69,7 +70,7 @@ impl Shell {
     }
 
     fn maybe_builtin(&self, cmd: &Command) -> Option<int> {
-        return match cmd.program.as_slice() {
+        match cmd.program.as_slice() {
             "jobs" => {
                 for &(jid, pid) in self.jobs.iter() {
                     println!("job {} is running, pid {}", jid, pid);
@@ -85,8 +86,8 @@ impl Shell {
             },
             "history" => {
                 let n = cmd.arguments.get(0).map_or(self.history.len(), |x| from_str(x.as_str().unwrap()).unwrap());
-                for (num, cmd) in self.history.rev_iter().take(n).enumerate() {
-                    println!("{}: {}", num, *cmd);
+                for (num, cmd) in self.history.iter().take(n).enumerate() {
+                    println!("{}: {}", num+1, *cmd);
                 }
                 Some(0)
             },
@@ -138,6 +139,29 @@ impl Shell {
 
     /// Run the command in a new process.
     fn execute(&mut self, cmd: Command) -> Option<int> {
+        // execute from history
+        if cmd.program.starts_with("!") {
+            match from_str::<int>(cmd.program.slice_from(1)) {
+                Some(mut v) => {
+                    if v < 0 {
+                        v = self.history.len() as int + v;
+                    }
+                    if v > self.history.len() as int || v < 0 {
+                        writeln!(&mut stderr(), "tried to run non-existent history item {}",
+                                 v as uint);
+                        return Some(1);
+                    }
+                    let cmd2 = self.history[v].clone();
+                    self.execute(cmd2);
+                    return Some(0);
+                },
+                None => {
+                    writeln!(&mut stderr(), "invalid index in !num execution");
+                    return Some(1);
+                }
+            }
+        }
+
         match self.maybe_builtin(&cmd) {
             Some(s) => return Some(s),
             None => ()
