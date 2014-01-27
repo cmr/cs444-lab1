@@ -86,7 +86,7 @@ impl Shell {
             },
             "history" => {
                 let n = cmd.arguments.get(0).map_or(self.history.len(), |x| from_str(x.as_str().unwrap()).unwrap());
-                for (num, cmd) in self.history.iter().take(n).enumerate() {
+                for (num, cmd) in self.history.iter().enumerate().take(n) {
                     println!("{}: {}", num+1, *cmd);
                 }
                 Some(0)
