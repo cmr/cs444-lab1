@@ -326,9 +326,6 @@ fn main(argc: int, argv: **u8) -> int {
                         if WIFEXITED(res) {
                             remove_jobs.push(jid);
                             println!("job {} has exited", jid);
-                        } else if res != 0xFFFF {
-                            // W_CONTINUED
-                            continue;
                         }
                     }
                     let mut jobs = shell.jobs.iter().map(|x| x.clone())
