@@ -4,72 +4,78 @@
 // This is very unidiomatic Rust. It should rather use std::run, but in the
 // spirit of the assignment, I have rolled my own using libc directly.
 
-// don't use the libuv-based M:N threaded runtime
-#[no_uv];
-#[crate_id = "cmrsh"];
-
-// link to the native runtime
-extern mod native;
+extern crate libc;
+#[macro_use] extern crate log;
 
 use std::os;
-use std::libc;
-use std::c_str::CString;
-use std::io::BufferedReader;
-use std::libc::{c_char, c_int};
-use std::io::{stdin, stdout, stderr};
-use std::libc::funcs::posix88::signal::kill;
-use std::libc::funcs::posix01::wait::waitpid;
+use std::ffi::CString;
+use std::old_io::BufferedReader;
+use libc::{c_char, c_int};
+use std::old_io::{stdin, stdout, stderr};
+use std::old_io::fs::PathExtensions;
+use std::old_path::BytesContainer;
+use libc::funcs::posix88::signal::kill;
+use libc::funcs::posix88::unistd::fork;
+use std::mem::transmute;
 
 // from bits/waitflags.h; glibc specific. no bindings in std::libc
 static WNOHANG: c_int = 1;
 static WCONTINUED: c_int = 8;
 
-struct Shell {
-    jobs: ~[(int, libc::pid_t)],
-    job_id: int,
-    history: ~[Command]
+extern {
+    fn waitpid(child: c_int, stat_loc: *mut c_int, options: c_int) -> c_int ;
 }
 
-#[deriving(Clone)]
+struct Shell {
+    jobs: Vec<(isize, libc::pid_t)>,
+    job_id: isize,
+    history: Vec<Command>
+}
+
+#[derive(Clone)]
 struct Command {
     /// Program to run (first non-env-var-setting part of line)
-    program: ~str,
-    arguments: ~[CString],
-    env_vars: ~[(~str, ~str)],
-    out: Option<~str>,
-    in_: Option<~str>,
+    program: String,
+    arguments: Vec<CString>,
+    env_vars: Vec<(String, String)>,
+    out: Option<String>,
+    in_: Option<String>,
     bg: bool,
 }
 
-impl std::fmt::Default for Command {
-    fn fmt(v: &Command, f: &mut std::fmt::Formatter) {
-        write!(f.buf, " {}", v.program);
-        for arg in v.arguments.iter() {
-            write!(f.buf, " {}", arg.as_str().unwrap());
+fn from_str<T: std::str::FromStr>(x: &str) -> Option<T> {
+    std::str::FromStr::from_str(x).ok()
+}
+
+impl std::fmt::String for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, " {}", self.program);
+        for arg in self.arguments.iter() {
+            write!(f, " {}", arg.container_as_str().unwrap());
         }
-        v.out.as_ref().map(|o| write!(f.buf, " > {}", *o));
-        v.in_.as_ref().map(|i| write!(f.buf, " < {}", *i));
-        if v.bg {
-            write!(f.buf, "&");
+        self.out.as_ref().map(|o| write!(f, " > {}", *o));
+        self.in_.as_ref().map(|i| write!(f, " < {}", *i));
+        if self.bg {
+            write!(f, "&");
         }
+        Ok(())
     }
 }
 
 fn dupfd(p: &str, to_fd: c_int, flags: c_int) {
-    let fd = p.with_c_str(|cstr| {
-        unsafe { libc::open(cstr, flags, libc::S_IRWXU) }
-    });
+    let ps = CString::from_slice(p.as_bytes());
+    let fd = unsafe { libc::open(ps.as_bytes_with_nul().as_ptr() as *const _, flags, libc::S_IRWXU) };
     if unsafe { libc::dup2(fd, to_fd) } != to_fd {
-        fail!("fcntl returned -1, errno={}", os::last_os_error());
+        panic!("fcntl returned -1, errno={}", os::last_os_error());
     }
 }
 
 impl Shell {
     fn new() -> Shell {
-        Shell { jobs: ~[], history: ~[], job_id: 0 }
+        Shell { jobs: Vec::new(), history: Vec::new(), job_id: 0 }
     }
 
-    fn maybe_builtin(&self, cmd: &Command) -> Option<int> {
+    fn maybe_builtin(&self, cmd: &Command) -> Option<isize> {
         match cmd.program.as_slice() {
             "jobs" => {
                 for &(jid, pid) in self.jobs.iter() {
@@ -79,13 +85,13 @@ impl Shell {
             },
             "cd" => {
                 match cmd.arguments.get(0) {
-                    Some(p) => { os::change_dir(&Path::new(p.as_str().unwrap())); },
+                    Some(p) => { os::change_dir(&Path::new(p.container_as_str().unwrap())); },
                     None    => { writeln!(&mut stderr(), "cd requires an argument"); return Some(1); }
                 }
                 Some(0)
             },
             "history" => {
-                let n = cmd.arguments.get(0).map_or(self.history.len(), |x| from_str(x.as_str().unwrap()).unwrap());
+                let n = cmd.arguments.get(0).map_or(self.history.len(), |x| from_str(x.container_as_str().unwrap()).unwrap());
                 for (num, cmd) in self.history.iter().enumerate().take(n) {
                     println!("{}: {}", num+1, *cmd);
                 }
@@ -96,8 +102,8 @@ impl Shell {
                     println!("Not exiting; there are jobs running");
                 } else {
                     unsafe {
-                        std::libc::exit(cmd.arguments.get(0)
-                                        .map_or(0, |s| from_str(s.as_str().unwrap()).unwrap()));
+                        libc::exit(cmd.arguments.get(0)
+                                      .map_or(0, |s| from_str(s.container_as_str().unwrap()).unwrap()));
                     }
                 }
                 Some(1)
@@ -105,7 +111,7 @@ impl Shell {
             "kill" => {
                 match cmd.arguments.get(0) {
                     Some(p) => {
-                        let p = p.as_str().unwrap();
+                        let p = p.container_as_str().unwrap();
                         if p.starts_with("%") {
                             let jid = from_str(p.slice_from(1)).unwrap();
                             let pid = self.jobs.iter().find(|& &(_, j)| j == jid);
@@ -121,7 +127,7 @@ impl Shell {
             },
             "help" => {
                 match cmd.arguments.get(0) {
-                    Some(c) => match c.as_str().unwrap() {
+                    Some(c) => match c.container_as_str().unwrap() {
                         "jobs" => println!("jobs - print list of running background jobs"),
                         "cd" => println!("cd <dir> - change cwd to <dir>"),
                         "history" => println!("history [n] - print the last n lines of history (default, all history)"),
@@ -138,17 +144,17 @@ impl Shell {
     }
 
     /// Run the command in a new process.
-    fn execute(&mut self, cmd: Command) -> Option<int> {
+    fn execute(&mut self, cmd: Command) -> Option<isize> {
         // execute from history
         if cmd.program.starts_with("!") {
-            match from_str::<int>(cmd.program.slice_from(1)) {
+            match from_str::<isize>(cmd.program.slice_from(1)) {
                 Some(mut v) => {
+                    let mut v = v as usize;
                     if v < 0 {
-                        v = self.history.len() as int + v;
+                        v = self.history.len() + v;
                     }
-                    if v > self.history.len() as int || v < 0 {
-                        writeln!(&mut stderr(), "tried to run non-existent history item {}",
-                                 v as uint);
+                    if v > self.history.len() || v < 0 {
+                        writeln!(&mut stderr(), "tried to run non-existent history item {}", v);
                         return Some(1);
                     }
                     let cmd2 = self.history[v].clone();
@@ -167,7 +173,7 @@ impl Shell {
             None => ()
         }
         if "" == cmd.program { return None }
-        let cmd_ = match find_cmd(cmd.program) {
+        let cmd_ = match find_cmd(&cmd.program) {
             Some(c) => c,
             None => {
                 writeln!(&mut stderr(), "command not found: {}", cmd.program);
@@ -176,33 +182,33 @@ impl Shell {
         };
 
         // this is very disgusting.
-        match unsafe { libc::fork() } {
+        match unsafe { fork() } {
             0 => {
                 // we are child
-                cmd_.with_c_str(|cstr| {
-                    // setup argv
-                    let mut args = ~[cstr];
-                    args.extend(&mut cmd.arguments.iter().map(|x| x.with_ref(|y| y)));
-                    args.push(0 as *c_char);
+                let cstr = CString::from_slice(cmd_.as_vec());
+                let cstr = cstr.as_bytes_with_nul().as_ptr();
+                // setup argv
+                let mut args = vec![cstr];
+                args.extend(&mut cmd.arguments.iter().map(|x| x.as_bytes_with_nul().as_ptr()));
+                args.push(0 as *const u8);
 
-                    // setup envp
-                    let mut env = os::env();
-                    env.extend(&mut cmd.env_vars.iter().map(|p| p.clone()));
-                    let env: ~[CString] = env.iter()
-                                          .map(|&(ref a, ref b)| format!("{}={}", *a, *b).to_c_str())
-                                          .collect();
+                // setup envp
+                let mut env = os::env();
+                env.extend(&mut cmd.env_vars.iter().map(|p| p.clone()));
+                let env: Vec<CString> = env.iter()
+                                        .map(|&(ref a, ref b)| CString::from_slice(format!("{}={}", *a, *b).as_bytes()))
+                                        .collect();
 
-                    let mut env2: ~[*c_char] = env.iter().map(|x| x.with_ref(|y| y)).collect();
-                    env2.push(0 as *c_char);
+                let mut env2: Vec<*mut c_char> = env.iter().map(|x| x.as_bytes().as_ptr() as *mut _).collect();
+                env2.push(0 as *mut c_char);
 
-                    // redirection?
-                    cmd.out.as_ref().map(|o| dupfd(*o, libc::STDOUT_FILENO, libc::O_CREAT | libc::O_RDWR));
-                    cmd.in_.as_ref().map(|i| dupfd(*i, libc::STDIN_FILENO, libc::O_RDONLY));
+                // redirection?
+                cmd.out.as_ref().map(|o| dupfd(o, libc::STDOUT_FILENO, libc::O_CREAT | libc::O_RDWR));
+                cmd.in_.as_ref().map(|i| dupfd(i, libc::STDIN_FILENO, libc::O_RDONLY));
 
-                    if unsafe { libc::execve(cstr, args.as_ptr(), env2.as_ptr()) } == -1 {
-                        fail!("execve failed, errno={}", os::last_os_error());
-                    }
-                });
+                if unsafe { libc::execve(transmute(cstr), transmute(args.as_ptr()), transmute(env2.as_ptr())) } == -1 {
+                    panic!("execve failed, errno={}", os::last_os_error());
+                }
                 unreachable!()
             },
             child_pid if child_pid > 0 => {
@@ -218,28 +224,28 @@ impl Shell {
                 if WIFEXITED(res) {
                     let res = WEXITSTATUS(res);
                     debug!("child exited with {}", res);
-                    return Some(res as int);
+                    return Some(res as isize);
                 } else {
                     info!("child exited abnormally (signal?");
-                    fail!("unimplemented")
+                    panic!("unimplemented")
                 }
             },
-            error if error < 0 => fail!("fork error {}", error),
+            error if error < 0 => panic!("fork error {}", error),
             _ => unreachable!()
         }
     }
 }
 
-fn prompt() -> ~str {
+fn prompt() -> String {
     let cwd = os::getcwd();
-    format!("{}> ", cwd.display())
+    format!("{}> ", cwd.unwrap().display())
 }
 
 fn parse_line(l: &str) -> Command {
     // yikes, ad-hoc parser!
-    let mut env_vars = ~[];
-    let mut args = ~[];
-    let mut program = ~"";
+    let mut env_vars = Vec::new();
+    let mut args = Vec::new();
+    let mut program = "".to_string();
     let mut out_file = None;
     let mut in_file = None;
     let mut found_bg = false;
@@ -256,19 +262,19 @@ fn parse_line(l: &str) -> Command {
                     if !word.contains_char('=') {
                         // program
                         seen_non_eq = true;
-                        program = word.to_owned();
+                        program = word.to_string();
                     } else {
                         // env var
                         let idx = word.find('=').unwrap();
-                        let env_entry = (word.slice_to(idx).to_owned(), word.slice_from(idx+1).to_owned());
+                        let env_entry = (word.slice_to(idx).to_string(), word.slice_from(idx+1).to_string());
                         env_vars.push(env_entry);
                     }
                 } else {
                     match word {
-                        ">" => out_file = Some(words.next().expect("no out file in redirection").to_owned()),
-                        "<" => in_file = Some(words.next().expect("no in file in redirectoin").to_owned()),
+                        ">" => out_file = Some(words.next().expect("no out file in redirection").to_string()),
+                        "<" => in_file = Some(words.next().expect("no in file in redirectoin").to_string()),
                         "&" => found_bg = true,
-                        _   => { found_bg = false; args.push(word.to_c_str()) }
+                        _   => { found_bg = false; args.push(CString::from_slice(word.as_bytes())) }
                     }
                 }
             },
@@ -292,7 +298,7 @@ fn find_cmd(cmd: &str) -> Option<Path> {
     if p.exists() {
         return Some(p);
     }
-    let path = os::getenv("PATH").unwrap_or_else(|| ~".:/usr/bin:/bin");
+    let path = os::getenv("PATH").unwrap_or_else(|| ".:/usr/bin:/bin".to_string());
     for entry in path.split(':') {
         let mut p = Path::new(entry);
         p.push(cmd);
@@ -303,39 +309,35 @@ fn find_cmd(cmd: &str) -> Option<Path> {
     None
 }
 
-// entry point
-#[start]
-fn main(argc: int, argv: **u8) -> int {
-    // start the runtime
-    do native::start(argc, argv) {
-        let mut shell = Shell::new();
-        let mut stdin = BufferedReader::new(stdin());
-        let mut stdout = stdout();
-        loop {
-            // shell mainloop
-            let p = prompt();
-            stdout.write(p.as_bytes());
+fn main() {
+    let mut shell = Shell::new();
+    let mut stdin = BufferedReader::new(stdin());
+    let mut stdout = stdout();
+    loop {
+        // shell mainloop
+        let p = prompt();
+        stdout.write(p.as_bytes());
+        stdout.flush();
 
-            match stdin.read_line() {
-                Some(s) => {
-                    // do we have any waiting jobs?
-                    let mut remove_jobs = ~[];
-                    for &(jid, pid) in shell.jobs.iter() {
-                        let mut res = 0;
-                        let res = unsafe { waitpid(pid, &mut res, WNOHANG | WCONTINUED) };
-                        if WIFEXITED(res) {
-                            remove_jobs.push(jid);
-                            println!("job {} has exited", jid);
-                        }
+        match stdin.read_line() {
+            Ok(s) => {
+                // do we have any waiting jobs?
+                let mut remove_jobs = Vec::new();
+                for &(jid, pid) in shell.jobs.iter() {
+                    let mut res = 0;
+                    let res = unsafe { waitpid(pid, &mut res, WNOHANG | WCONTINUED) };
+                    if WIFEXITED(res) {
+                        remove_jobs.push(jid);
+                        println!("job {} has exited", jid);
                     }
-                    let mut jobs = shell.jobs.iter().map(|x| x.clone())
-                                         .filter(|&(jid, _)| !remove_jobs.contains(&jid)).collect();
-                    std::util::swap(&mut jobs, &mut shell.jobs);
-                    let cmd = parse_line(s.trim());
-                    shell.execute(cmd);
-                },
-                None => unsafe { println!(""); std::libc::exit(0) }
-            }
+                }
+                let mut jobs = shell.jobs.iter().map(|x| x.clone())
+                                     .filter(|&(jid, _)| !remove_jobs.contains(&jid)).collect();
+                std::mem::swap(&mut jobs, &mut shell.jobs);
+                let cmd = parse_line(s.trim());
+                shell.execute(cmd);
+            },
+            Err(e) => unsafe { println!("{}", e); libc::exit(0) }
         }
     }
 }
